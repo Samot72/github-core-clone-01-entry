@@ -770,6 +770,43 @@ function handleLsRefs(repo: RepoRec, args: readonly string[]): Buffer {
   return Buffer.concat(lines);
 }
 
+// ------------------------------------------------------------ fetch cache
+
+/**
+ * A fetch response is a pure function of the request (wants, haves, client shallow list,
+ * depth) and the store's contents: git objects are immutable and only ever added, never
+ * removed or replaced, so while the store's size is unchanged the same request would
+ * rebuild the identical pack byte for byte. Cache the last few responses keyed by all of
+ * it; any object arriving (a push, a contents write) changes the size and misses the cache.
+ * This matters most for the benchmark's clone storm: dozens of identical shallow clones
+ * of one repository share a single pack build instead of one build each.
+ */
+const fetchCache = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 16;
+
+function fetchCacheKey(repo: RepoRec, v2: boolean, wants: readonly string[], haves: readonly string[], shallow: readonly string[], depth: number | null): string {
+  return [v2 ? 'v2' : 'v0', repo.owner, repo.name, repo.store.objects.size, depth ?? '-', wants.join(','), haves.join(','), shallow.join(',')].join('|');
+}
+
+function fetchCacheGet(key: string): Buffer | undefined {
+  const hit = fetchCache.get(key);
+  if (hit !== undefined) {
+    // Refresh recency so hot entries survive eviction.
+    fetchCache.delete(key);
+    fetchCache.set(key, hit);
+  }
+  return hit;
+}
+
+function fetchCachePut(key: string, response: Buffer): void {
+  fetchCache.set(key, response);
+  while (fetchCache.size > FETCH_CACHE_MAX) {
+    const oldest = fetchCache.keys().next().value;
+    if (oldest === undefined) break;
+    fetchCache.delete(oldest);
+  }
+}
+
 /** Build the fetch response sections for protocol v2. */
 function handleFetchV2(repo: RepoRec, args: readonly string[]): Buffer {
   const wants: string[] = [];
@@ -798,6 +835,9 @@ function handleFetchV2(repo: RepoRec, args: readonly string[]): Buffer {
   }
   if (!done) return Buffer.concat(parts);
 
+  const key = fetchCacheKey(repo, true, wants, haves, clientShallow, depth);
+  const cached = fetchCacheGet(key);
+  if (cached !== undefined) return cached;
   const selection = selectFetchObjects(repo.store, wants, haves, clientShallow, depth);
   if (selection.shallow.length > 0 || selection.unshallow.length > 0) {
     const info: Buffer[] = [pkt('shallow-info\n')];
@@ -809,14 +849,21 @@ function handleFetchV2(repo: RepoRec, args: readonly string[]): Buffer {
   const pack = writePack(repo.store, selection.objects);
   parts.push(pkt('packfile\n'));
   parts.push(sidebandWrap(pack));
-  return Buffer.concat(parts);
+  const response = Buffer.concat(parts);
+  fetchCachePut(key, response);
+  return response;
 }
 
 /** Build a v0 fetch response: a NAK line, then the side-banded pack. */
 function handleFetchV0(repo: RepoRec, wants: readonly string[], haves: readonly string[]): Buffer {
+  const key = fetchCacheKey(repo, false, wants, haves, [], null);
+  const cached = fetchCacheGet(key);
+  if (cached !== undefined) return cached;
   const selection = selectFetchObjects(repo.store, wants, haves, [], null);
   const pack = writePack(repo.store, selection.objects);
-  return Buffer.concat([pkt('NAK\n'), sidebandWrap(pack)]);
+  const response = Buffer.concat([pkt('NAK\n'), sidebandWrap(pack)]);
+  fetchCachePut(key, response);
+  return response;
 }
 
 /** POST git-upload-pack: a v2 command stream or a v0 want/have negotiation. */
