@@ -45,9 +45,18 @@ export function tick(): number {
   return clockSeq;
 }
 
-/** ISO timestamp for a sequence number. */
+/**
+ * ISO timestamp for a sequence number. A pure function of `seq` (the clock base is fixed
+ * at module load), and the serializers call it several times per response, so memoize:
+ * Date construction + toISOString is the serializers' most expensive single step.
+ */
+const isoCache: string[] = [];
 export function isoAt(seq: number): string {
-  return new Date(CLOCK_BASE_MS + seq * 1000).toISOString();
+  const cached = isoCache[seq];
+  if (cached !== undefined) return cached;
+  const iso = new Date(CLOCK_BASE_MS + seq * 1000).toISOString();
+  isoCache[seq] = iso;
+  return iso;
 }
 
 /** The current logical time as ISO (advances the clock). */
@@ -78,6 +87,12 @@ export interface IssueRec {
   labels: string[];
   comments: CommentRec[];
   seq: number;
+  /**
+   * Mutation counter for the REST body's cache in app.ts: every write to an existing
+   * issue's serialized fields (REST PATCH, GraphQL closeIssue, addComment) must bump it,
+   * so a cached body is only ever served for the exact state that produced it.
+   */
+  version: number;
 }
 
 export interface PullRec {
@@ -340,6 +355,7 @@ export function createIssue(repo: RepoRec, title: string, body: string, labelNam
     labels: [...labelNames],
     comments: [],
     seq: tick(),
+    version: 0,
   };
   repo.nextNumber += 1;
   nextIssueId += 1;
@@ -352,6 +368,7 @@ export function addComment(repo: RepoRec, issue: IssueRec, body: string): Commen
   const comment: CommentRec = { id: nextCommentId, body, seq: tick() };
   nextCommentId += 1;
   issue.comments.push(comment);
+  issue.version += 1; // the issue body carries the comment count
   return comment;
 }
 

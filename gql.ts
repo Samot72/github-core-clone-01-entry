@@ -763,6 +763,7 @@ function resolveMutation(field: GqlField, ctx: ExecCtx): unknown {
       }
       const issue = target.data.issue as IssueRec;
       issue.state = 'closed';
+      issue.version += 1;
       return obj('CloseIssuePayload', { issue: target, clientMutationId: input.clientMutationId ?? null });
     }
     case 'createPullRequest': {
