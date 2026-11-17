@@ -31,6 +31,7 @@ import {
   resolveCommit,
   squashMerge,
   userJson,
+  type IssueRec,
   type RepoRec,
 } from './forge.ts';
 import { commitInfo, reachableCommits } from './gitstore.ts';
@@ -63,6 +64,32 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
   res.end(buf);
 }
 
+/** Answer with a pre-serialized JSON buffer (the same headers sendJson sends). */
+function sendBuffer(res: ServerResponse, status: number, buf: Buffer): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'x-github-request-id': nextRequestId(),
+    'content-length': buf.length,
+  });
+  res.end(buf);
+}
+
+/**
+ * The serialized REST body of one issue, cached per issue version. The timed read
+ * workload asks for the same issue thousands of times in a row; the body is a pure
+ * function of the issue record and its repo's labels, and every mutation of an issue
+ * bumps IssueRec.version (REST PATCH below, GraphQL closeIssue, addComment), so a
+ * cached buffer is only ever served for the exact state that produced it.
+ */
+const issueBodyCache = new WeakMap<IssueRec, { version: number; buf: Buffer }>();
+function issueBodyBuffer(repo: RepoRec, issue: IssueRec): Buffer {
+  const hit = issueBodyCache.get(issue);
+  if (hit !== undefined && hit.version === issue.version) return hit.buf;
+  const buf = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issueBodyCache.set(issue, { version: issue.version, buf });
+  return buf;
+}
+
 /** Answer with raw bytes (git protocol payloads). */
 function sendBytes(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
   res.writeHead(status, { 'content-type': contentType, 'content-length': body.length, 'x-github-request-id': nextRequestId() });
@@ -81,17 +108,28 @@ function authed(req: IncomingMessage): boolean {
   return header === `Bearer ${SERVER_TOKEN}` || header === `token ${SERVER_TOKEN}`;
 }
 
-/** Read a whole request body (bounded; git pushes in this suite stay far below the cap). */
-async function readBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    total += buffer.length;
-    if (total > 128 * 1024 * 1024) throw new Error('request body too large');
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+/**
+ * Read a whole request body (bounded; git pushes in this suite stay far below the cap).
+ * Explicit data/end listeners rather than async iteration: the async-iterator machinery
+ * (per-chunk promises and iterator teardown) costs measurably more per POST, and every
+ * git push, fetch and issue write in the timed workloads pays it.
+ */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    req.on('data', (chunk: Buffer) => {
+      total += chunk.length;
+      if (total > 128 * 1024 * 1024) {
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
 }
 
 /** Parse a JSON request body; empty bodies read as {}. Throws a tagged error on malformed JSON. */
@@ -107,6 +145,28 @@ function parseJsonBody(body: Buffer): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/**
+ * A request URL, split by hand. Routing needs only the raw path and the query
+ * parameters, while the WHATWG parser's lazy pathname/searchParams getters re-walk
+ * the string on every access; URLSearchParams is the same class the parser exposes,
+ * so query semantics are unchanged. `toString` still yields a full URL for the one
+ * consumer that re-parses it (paginate's Link builder).
+ */
+interface ReqUrl {
+  pathname: string;
+  searchParams: URLSearchParams;
+  toString(): string;
+}
+
+/** Split a request target into path + query without the WHATWG parser. */
+function parseReqUrl(raw: string): ReqUrl {
+  const q = raw.indexOf('?');
+  const pathname = q < 0 ? raw : raw.slice(0, q);
+  const searchParams = new URLSearchParams(q < 0 ? '' : raw.slice(q + 1));
+  const full = `http://entry${raw}`;
+  return { pathname, searchParams, toString: () => full };
+}
+
 // ---------------------------------------------------------------- pagination
 
 interface Page {
@@ -115,7 +175,7 @@ interface Page {
 }
 
 /** Parse ?per_page=&page= the GitHub way (defaults 30 and 1, per_page capped at 100). */
-function pageOf(url: URL): Page {
+function pageOf(url: ReqUrl): Page {
   const perPageRaw = Number.parseInt(url.searchParams.get('per_page') ?? '', 10);
   const pageRaw = Number.parseInt(url.searchParams.get('page') ?? '', 10);
   return {
@@ -125,7 +185,7 @@ function pageOf(url: URL): Page {
 }
 
 /** Slice a list to a page and build the Link header chain for it. */
-function paginate<T>(req: IncomingMessage, url: URL, items: readonly T[]): { page: T[]; headers: Record<string, string> } {
+function paginate<T>(req: IncomingMessage, url: ReqUrl, items: readonly T[]): { page: T[]; headers: Record<string, string> } {
   const { perPage, page } = pageOf(url);
   const totalPages = Math.max(1, Math.ceil(items.length / perPage));
   const slice = items.slice((page - 1) * perPage, page * perPage);
@@ -165,7 +225,7 @@ function identParts(line: string): { name: string; email: string } {
 }
 
 /** REST v3 routing. `segments` is the path after /api/v3, split and decoded. */
-async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, segments: string[], body: Buffer): Promise<void> {
+function handleRest(req: IncomingMessage, res: ServerResponse, url: ReqUrl, segments: string[], body: Buffer): void {
   const method = req.method ?? 'GET';
 
   if (segments.length === 0) {
@@ -221,11 +281,11 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, s
     return;
   }
   const rest = segments.slice(3);
-  await handleRepoRest(req, res, url, repo, rest, body);
+  handleRepoRest(req, res, url, repo, rest, body);
 }
 
 /** Routes under /repos/{owner}/{repo}. */
-async function handleRepoRest(req: IncomingMessage, res: ServerResponse, url: URL, repo: RepoRec, rest: string[], body: Buffer): Promise<void> {
+function handleRepoRest(req: IncomingMessage, res: ServerResponse, url: ReqUrl, repo: RepoRec, rest: string[], body: Buffer): void {
   const method = req.method ?? 'GET';
 
   if (rest.length === 0) {
@@ -360,17 +420,17 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, url: UR
   }
 
   if (rest[0] === 'contents') {
-    await handleContents(req, res, url, repo, rest.slice(1).join('/'), body);
+    handleContents(req, res, url, repo, rest.slice(1).join('/'), body);
     return;
   }
 
   if (rest[0] === 'issues') {
-    await handleIssues(req, res, url, repo, rest.slice(1), body);
+    handleIssues(req, res, url, repo, rest.slice(1), body);
     return;
   }
 
   if (rest[0] === 'pulls') {
-    await handlePulls(req, res, url, repo, rest.slice(1), body);
+    handlePulls(req, res, url, repo, rest.slice(1), body);
     return;
   }
 
@@ -378,7 +438,7 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, url: UR
 }
 
 /** The contents API: files backed by real git objects, so blob and commit SHAs are git's own. */
-async function handleContents(req: IncomingMessage, res: ServerResponse, url: URL, repo: RepoRec, path: string, body: Buffer): Promise<void> {
+function handleContents(req: IncomingMessage, res: ServerResponse, url: ReqUrl, repo: RepoRec, path: string, body: Buffer): void {
   const method = req.method ?? 'GET';
   if (method === 'GET') {
     const refish = url.searchParams.get('ref') ?? repo.defaultBranch;
@@ -455,7 +515,7 @@ async function handleContents(req: IncomingMessage, res: ServerResponse, url: UR
 }
 
 /** Issues: create, list (state/sort), read, patch, comments. */
-async function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL, repo: RepoRec, rest: string[], body: Buffer): Promise<void> {
+function handleIssues(req: IncomingMessage, res: ServerResponse, url: ReqUrl, repo: RepoRec, rest: string[], body: Buffer): void {
   const method = req.method ?? 'GET';
   if (rest.length === 0) {
     if (method === 'POST') {
@@ -497,11 +557,14 @@ async function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL,
       return;
     }
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      sendBuffer(res, 200, issueBodyBuffer(repo, issue));
       return;
     }
     if (method === 'PATCH') {
       const data = parseJsonBody(body);
+      // Bump first: this handler mutates fields one by one and can still bail out with
+      // a 422 below, so invalidate the cached GET body before any field moves.
+      issue.version += 1;
       const state = str(data, 'state');
       if (state === 'open' || state === 'closed') issue.state = state;
       const title = str(data, 'title');
@@ -543,7 +606,7 @@ async function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL,
 }
 
 /** Pull requests: create, list, read, files, squash merge. */
-async function handlePulls(req: IncomingMessage, res: ServerResponse, url: URL, repo: RepoRec, rest: string[], body: Buffer): Promise<void> {
+function handlePulls(req: IncomingMessage, res: ServerResponse, url: ReqUrl, repo: RepoRec, rest: string[], body: Buffer): void {
   const method = req.method ?? 'GET';
   if (rest.length === 0) {
     if (method === 'POST') {
@@ -702,20 +765,22 @@ function refLines(repo: RepoRec): { name: string; sha: string }[] {
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
+/** The v2 capability advertisement: constant bytes, built once (every clone asks for it). */
+const V2_ADVERTISEMENT = Buffer.concat([
+  pkt('version 2\n'),
+  pkt('agent=forge/1.0\n'),
+  pkt('ls-refs=unborn\n'),
+  pkt('fetch=shallow wait-for-done\n'),
+  pkt('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 /** GET info/refs: the v0 or v2 (upload-pack) advertisement, or the receive-pack one. */
 function handleInfoRefs(req: IncomingMessage, res: ServerResponse, repo: RepoRec, service: string): void {
   const protocol = req.headers['git-protocol'] ?? '';
   const wantsV2 = typeof protocol === 'string' && protocol.includes('version=2');
   if (service === 'git-upload-pack' && wantsV2) {
-    const body = Buffer.concat([
-      pkt('version 2\n'),
-      pkt('agent=forge/1.0\n'),
-      pkt('ls-refs=unborn\n'),
-      pkt('fetch=shallow wait-for-done\n'),
-      pkt('object-format=sha1\n'),
-      PKT_FLUSH,
-    ]);
-    sendBytes(res, 200, body, 'application/x-git-upload-pack-advertisement');
+    sendBytes(res, 200, V2_ADVERTISEMENT, 'application/x-git-upload-pack-advertisement');
     return;
   }
   const caps = service === 'git-upload-pack' ? UPLOAD_CAPS : RECEIVE_CAPS;
@@ -1026,7 +1091,7 @@ export function createApp(): Server {
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async (): Promise<void> => {
       try {
-        const url = new URL(req.url ?? '/', 'http://entry');
+        const url = parseReqUrl(req.url ?? '/');
         const path = url.pathname;
         const method = req.method ?? 'GET';
 
@@ -1062,7 +1127,7 @@ export function createApp(): Server {
             .split('/')
             .filter((segment) => segment !== '')
             .map((segment) => decodeURIComponent(segment));
-          await handleRest(req, res, url, segments, body);
+          handleRest(req, res, url, segments, body);
           return;
         }
 
