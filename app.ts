@@ -33,7 +33,7 @@ import {
   userJson,
   type RepoRec,
 } from './forge.ts';
-import { parseCommit, reachableCommits } from './gitstore.ts';
+import { commitInfo, reachableCommits } from './gitstore.ts';
 import { handleGraphQL } from './gql.ts';
 import { handleMcp } from './mcp.ts';
 
@@ -51,13 +51,16 @@ function nextRequestId(): string {
 /** Answer with a JSON body and the headers every GitHub reply carries. */
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = body === undefined ? '' : `${JSON.stringify(body)}\n`;
+  // Encode once and reuse the buffer for both the length header and the body:
+  // byteLength + res.end(string) would scan and encode the text a second time.
+  const buf = Buffer.from(text, 'utf8');
   res.writeHead(status, {
     'content-type': JSON_TYPE,
     'x-github-request-id': nextRequestId(),
-    ...(text === '' ? {} : { 'content-length': Buffer.byteLength(text) }),
+    ...(text === '' ? {} : { 'content-length': buf.length }),
     ...headers,
   });
-  res.end(text);
+  res.end(buf);
 }
 
 /** Answer with raw bytes (git protocol payloads). */
@@ -153,6 +156,14 @@ function str(body: Record<string, unknown>, key: string): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+/** Split a git ident line ("Name <email> ts tz") into the REST name/email pair. */
+function identParts(line: string): { name: string; email: string } {
+  const lt = line.indexOf(' <');
+  if (lt < 0) return { name: line, email: '' };
+  const gt = line.indexOf('>', lt + 2);
+  return { name: line.slice(0, lt), email: gt > lt ? line.slice(lt + 2, gt) : '' };
+}
+
 /** REST v3 routing. `segments` is the path after /api/v3, split and decoded. */
 async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, segments: string[], body: Buffer): Promise<void> {
   const method = req.method ?? 'GET';
@@ -175,8 +186,9 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, s
   }
   if (segments[0] === 'user' && segments[1] === 'repos') {
     if (method === 'GET') {
-      const { page, headers } = paginate(req, url, listRepos().map(repoJson));
-      sendJson(res, 200, page, headers);
+      // Slice first, serialize only the page: serializing every repo to slice ten is waste.
+      const { page, headers } = paginate(req, url, listRepos());
+      sendJson(res, 200, page.map(repoJson), headers);
       return;
     }
     if (method === 'POST') {
@@ -268,14 +280,13 @@ async function handleRepoRest(req: IncomingMessage, res: ServerResponse, url: UR
       return;
     }
     const all = reachableCommits(repo.store, tip).map((sha) => {
-      const object = repo.store.get(sha)!;
-      const info = parseCommit(object.data);
+      const info = commitInfo(repo.store, sha)!;
       return {
         sha,
         commit: {
           message: info.message.replace(/\n$/, ''),
-          author: { name: info.author.replace(/ <.*$/, ''), email: /<([^>]*)>/.exec(info.author)?.[1] ?? '' },
-          committer: { name: info.committer.replace(/ <.*$/, ''), email: /<([^>]*)>/.exec(info.committer)?.[1] ?? '' },
+          author: identParts(info.author),
+          committer: identParts(info.committer),
           tree: { sha: info.tree },
         },
         parents: info.parents.map((parent) => ({ sha: parent })),
@@ -472,8 +483,8 @@ async function handleIssues(req: IncomingMessage, res: ServerResponse, url: URL,
       else if (state === 'closed') issues = issues.filter((issue) => issue.state === 'closed');
       const direction = url.searchParams.get('direction') ?? 'desc';
       issues.sort((a, b) => (direction === 'asc' ? a.seq - b.seq : b.seq - a.seq));
-      const { page, headers } = paginate(req, url, issues.map((issue) => issueJson(repo, issue)));
-      sendJson(res, 200, page, headers);
+      const { page, headers } = paginate(req, url, issues);
+      sendJson(res, 200, page.map((issue) => issueJson(repo, issue)), headers);
       return;
     }
   }
@@ -560,8 +571,8 @@ async function handlePulls(req: IncomingMessage, res: ServerResponse, url: URL, 
       if (state === 'open') pulls = pulls.filter((pull) => pull.state === 'open');
       else if (state === 'closed') pulls = pulls.filter((pull) => pull.state === 'closed');
       pulls.sort((a, b) => b.seq - a.seq);
-      const { page, headers } = paginate(req, url, pulls.map((pull) => pullJson(repo, pull)));
-      sendJson(res, 200, page, headers);
+      const { page, headers } = paginate(req, url, pulls);
+      sendJson(res, 200, page.map((pull) => pullJson(repo, pull)), headers);
       return;
     }
   }

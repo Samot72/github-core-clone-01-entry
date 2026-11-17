@@ -9,10 +9,10 @@ import {
   ZERO_SHA,
   buildCommit,
   buildTreeFromFiles,
+  commitInfo,
   flattenTree,
   isAncestor,
   mergeBase,
-  parseCommit,
   treeEntryAt,
   treeListAt,
   type TreeEntry,
@@ -113,6 +113,7 @@ export interface RepoRec {
 }
 
 const repos = new Map<string, RepoRec>();
+const reposById = new Map<number, RepoRec>();
 let nextRepoId = 1;
 let nextIssueId = 1;
 let nextCommentId = 1;
@@ -129,8 +130,7 @@ export function getRepo(owner: string, name: string): RepoRec | null {
 
 /** Look up a repository by its numeric database id (GraphQL node/createPullRequest inputs). */
 export function getRepoById(id: number): RepoRec | null {
-  for (const repo of repos.values()) if (repo.id === id) return repo;
-  return null;
+  return reposById.get(id) ?? null;
 }
 
 /** All repositories owned by the account, in creation order. */
@@ -159,12 +159,14 @@ export function createRepo(name: string, options: { private?: boolean; descripti
   };
   nextRepoId += 1;
   repos.set(key, repo);
+  reposById.set(repo.id, repo);
   return repo;
 }
 
 /** Delete a repository outright. */
 export function deleteRepo(repo: RepoRec): void {
   repos.delete(repoKey(repo.owner, repo.name));
+  reposById.delete(repo.id);
 }
 
 // ---------------------------------------------------------------- refs & commits
@@ -235,9 +237,9 @@ export function commitOnBranch(repo: RepoRec, branch: string, treeSha: string, m
 
 /** The flat file map of a commit's tree. */
 export function filesOfCommit(repo: RepoRec, commitSha: string): Map<string, { sha: string; mode: string }> {
-  const object = repo.store.get(commitSha);
-  if (object === undefined || object.type !== 'commit') return new Map();
-  return flattenTree(repo.store, parseCommit(object.data).tree);
+  const info = commitInfo(repo.store, commitSha);
+  if (info === null) return new Map();
+  return flattenTree(repo.store, info.tree);
 }
 
 /**
@@ -298,9 +300,9 @@ export function deleteContent(
 export function readContentAt(repo: RepoRec, path: string, refish: string): { kind: 'file'; sha: string; mode: string; data: Buffer } | { kind: 'dir'; entries: TreeEntry[] } | null {
   const commit = resolveCommit(repo, refish);
   if (commit === null) return null;
-  const commitObject = repo.store.get(commit);
-  if (commitObject === undefined) return null;
-  const treeSha = parseCommit(commitObject.data).tree;
+  const info = commitInfo(repo.store, commit);
+  if (info === null) return null;
+  const treeSha = info.tree;
   if (path === '' || path === '/') {
     const entries = treeListAt(repo.store, treeSha, '');
     return entries === null ? null : { kind: 'dir', entries };
@@ -514,9 +516,11 @@ export function isAncestorCommit(repo: RepoRec, ancestor: string, descendant: st
 
 // ---------------------------------------------------------------- REST serializers
 
-/** The GitHub-shaped user object for the account. */
+/** The GitHub-shaped user object for the account: one shared instance, serialized per reply. */
+const USER_JSON: Record<string, unknown> = Object.freeze({ login: ACCOUNT_LOGIN, id: ACCOUNT_ID, type: 'User', site_admin: false });
+
 export function userJson(): Record<string, unknown> {
-  return { login: ACCOUNT_LOGIN, id: ACCOUNT_ID, type: 'User', site_admin: false };
+  return USER_JSON;
 }
 
 /** The GitHub-shaped repository object. */
