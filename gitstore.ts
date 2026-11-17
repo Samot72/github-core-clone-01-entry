@@ -23,6 +23,18 @@ export function objectId(type: ObjType, data: Buffer): string {
 /** One repository's object database. */
 export class Store {
   readonly objects = new Map<string, { type: ObjType; data: Buffer }>();
+  /**
+   * Memoized derivations, all pure functions of immutable object bytes: a stored object's
+   * parsed form, the closure of a tip, its reachable-commit list and its flattened tree can
+   * never change once computed (objects are only ever added, and a tip's ancestry is fixed
+   * by its bytes), so these caches need no invalidation. Callers must not mutate what the
+   * helpers hand back.
+   */
+  readonly commitInfoCache = new Map<string, CommitInfo>();
+  readonly treeCache = new Map<string, TreeEntry[]>();
+  readonly closureCache = new Map<string, Set<string>>();
+  readonly reachableCache = new Map<string, string[]>();
+  readonly flatCache = new Map<string, Map<string, { sha: string; mode: string }>>();
 
   has(sha: string): boolean {
     return this.objects.has(sha);
@@ -74,6 +86,17 @@ export function parseCommit(data: Buffer): CommitInfo {
   return { tree, parents, author, committer, message };
 }
 
+/** The parsed commit for an object id, memoized per store; null when absent or not a commit. */
+export function commitInfo(store: Store, sha: string): CommitInfo | null {
+  const cached = store.commitInfoCache.get(sha);
+  if (cached !== undefined) return cached;
+  const object = store.get(sha);
+  if (object === undefined || object.type !== 'commit') return null;
+  const info = parseCommit(object.data);
+  store.commitInfoCache.set(sha, info);
+  return info;
+}
+
 /** Serialize a commit object body. */
 export function buildCommit(info: CommitInfo): Buffer {
   let head = `tree ${info.tree}\n`;
@@ -112,6 +135,17 @@ export function parseTree(data: Buffer): TreeEntry[] {
   return entries;
 }
 
+/** The parsed entries of a tree object, memoized per store; null when absent or not a tree. */
+export function treeEntries(store: Store, sha: string): TreeEntry[] | null {
+  const cached = store.treeCache.get(sha);
+  if (cached !== undefined) return cached;
+  const object = store.get(sha);
+  if (object === undefined || object.type !== 'tree') return null;
+  const entries = parseTree(object.data);
+  store.treeCache.set(sha, entries);
+  return entries;
+}
+
 /** Git's tree-entry sort key: directories compare as if their name ended in '/'. */
 function treeSortKey(entry: TreeEntry): string {
   return entry.mode === '40000' ? `${entry.name}/` : entry.name;
@@ -133,15 +167,32 @@ export function isTreeMode(mode: string): boolean {
   return mode === '40000' || mode === '040000';
 }
 
-/** Flatten a tree into a map of full path -> blob entry, recursing into subtrees. */
-export function flattenTree(store: Store, treeSha: string, prefix = '', out = new Map<string, { sha: string; mode: string }>()): Map<string, { sha: string; mode: string }> {
-  const object = store.get(treeSha);
-  if (object === undefined || object.type !== 'tree') return out;
-  for (const entry of parseTree(object.data)) {
+/** Recursive worker for flattenTree (no caching; the public wrapper memoizes whole trees). */
+function flattenInto(store: Store, treeSha: string, prefix: string, out: Map<string, { sha: string; mode: string }>): void {
+  const entries = treeEntries(store, treeSha);
+  if (entries === null) return;
+  for (const entry of entries) {
     const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-    if (isTreeMode(entry.mode)) flattenTree(store, entry.sha, path, out);
+    if (isTreeMode(entry.mode)) flattenInto(store, entry.sha, path, out);
     else out.set(path, { sha: entry.sha, mode: entry.mode });
   }
+}
+
+/** Flatten a tree into a map of full path -> blob entry, recursing into subtrees. */
+export function flattenTree(store: Store, treeSha: string, prefix = '', out = new Map<string, { sha: string; mode: string }>()): Map<string, { sha: string; mode: string }> {
+  if (prefix !== '') {
+    flattenInto(store, treeSha, prefix, out);
+    return out;
+  }
+  // The whole-tree flattening is a pure function of the immutable tree: memoize it. The
+  // cached map is copied into `out`, so callers may freely mutate what they get back.
+  let flat = store.flatCache.get(treeSha);
+  if (flat === undefined) {
+    flat = new Map<string, { sha: string; mode: string }>();
+    flattenInto(store, treeSha, '', flat);
+    store.flatCache.set(treeSha, flat);
+  }
+  for (const [path, entry] of flat) out.set(path, entry);
   return out;
 }
 
@@ -150,9 +201,9 @@ export function treeEntryAt(store: Store, treeSha: string, path: string): { sha:
   const parts = path.split('/').filter((part) => part !== '');
   let current = treeSha;
   for (let i = 0; i < parts.length; i += 1) {
-    const object = store.get(current);
-    if (object === undefined || object.type !== 'tree') return null;
-    const entry = parseTree(object.data).find((candidate) => candidate.name === parts[i]);
+    const entries = treeEntries(store, current);
+    if (entries === null) return null;
+    const entry = entries.find((candidate) => candidate.name === parts[i]);
     if (entry === undefined) return null;
     if (i === parts.length - 1) return { sha: entry.sha, mode: entry.mode, type: isTreeMode(entry.mode) ? 'dir' : 'file' };
     if (!isTreeMode(entry.mode)) return null;
@@ -163,14 +214,10 @@ export function treeEntryAt(store: Store, treeSha: string, path: string): { sha:
 
 /** The directory listing of a tree at a path (entries of that subtree), or null when absent. */
 export function treeListAt(store: Store, treeSha: string, path: string): TreeEntry[] | null {
-  if (path === '' || path === '/') {
-    const object = store.get(treeSha);
-    return object !== undefined && object.type === 'tree' ? parseTree(object.data) : null;
-  }
+  if (path === '' || path === '/') return treeEntries(store, treeSha);
   const found = treeEntryAt(store, treeSha, path);
   if (found === null || found.type !== 'dir') return null;
-  const object = store.get(found.sha);
-  return object !== undefined && object.type === 'tree' ? parseTree(object.data) : null;
+  return treeEntries(store, found.sha);
 }
 
 /**
@@ -209,18 +256,21 @@ export function buildTreeFromFiles(store: Store, files: ReadonlyMap<string, { sh
 
 /** All commits reachable from `tip` (inclusive), breadth-first, parents in order. */
 export function reachableCommits(store: Store, tip: string): string[] {
+  const cached = store.reachableCache.get(tip);
+  if (cached !== undefined) return cached;
   const seen = new Set<string>();
   const order: string[] = [];
   const queue: string[] = [tip];
-  while (queue.length > 0) {
-    const sha = queue.shift()!;
+  for (let head = 0; head < queue.length; head += 1) {
+    const sha = queue[head]!;
     if (seen.has(sha)) continue;
-    const object = store.get(sha);
-    if (object === undefined || object.type !== 'commit') continue;
+    const info = commitInfo(store, sha);
+    if (info === null) continue;
     seen.add(sha);
     order.push(sha);
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    for (const parent of info.parents) queue.push(parent);
   }
+  store.reachableCache.set(tip, order);
   return order;
 }
 
@@ -229,14 +279,14 @@ export function isAncestor(store: Store, ancestor: string, descendant: string): 
   if (ancestor === descendant) return true;
   const seen = new Set<string>();
   const queue: string[] = [descendant];
-  while (queue.length > 0) {
-    const sha = queue.shift()!;
+  for (let head = 0; head < queue.length; head += 1) {
+    const sha = queue[head]!;
     if (sha === ancestor) return true;
     if (seen.has(sha)) continue;
     seen.add(sha);
-    const object = store.get(sha);
-    if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) queue.push(parent);
+    const info = commitInfo(store, sha);
+    if (info === null) continue;
+    for (const parent of info.parents) queue.push(parent);
   }
   return false;
 }
@@ -494,7 +544,10 @@ export function writePack(store: Store, shas: readonly string[]): Buffer {
       headBytes.push(byte);
     }
     parts.push(Buffer.from(headBytes));
-    parts.push(deflateSync(object.data));
+    // Level 1, not the default 6: pack building is CPU-bound and the transport here is
+    // loopback, so the ~4x faster compression of text at level 1 beats the slightly
+    // larger pack. The wire format is identical either way; git inflates any level.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
@@ -514,6 +567,13 @@ export interface FetchSelection {
 
 /** The full object closure (commits + trees + blobs + tags) reachable from a commit/tag id. */
 export function objectClosure(store: Store, tip: string, treatAsParentless: ReadonlySet<string> = new Set()): Set<string> {
+  // The plain closure of a tip is fixed by the tip's bytes: memoize it. The shallow-aware
+  // variant (a non-empty parentless set) depends on the caller's set and is not cached.
+  const memoize = treatAsParentless.size === 0;
+  if (memoize) {
+    const cached = store.closureCache.get(tip);
+    if (cached !== undefined) return cached;
+  }
   const out = new Set<string>();
   const stack: string[] = [tip];
   while (stack.length > 0) {
@@ -523,16 +583,17 @@ export function objectClosure(store: Store, tip: string, treatAsParentless: Read
     if (object === undefined) continue;
     out.add(sha);
     if (object.type === 'commit') {
-      const info = parseCommit(object.data);
+      const info = commitInfo(store, sha)!;
       stack.push(info.tree);
       if (!treatAsParentless.has(sha)) for (const parent of info.parents) stack.push(parent);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) stack.push(entry.sha);
+      for (const entry of treeEntries(store, sha)!) stack.push(entry.sha);
     } else if (object.type === 'tag') {
       const target = tagTarget(store, sha);
       if (target !== null) stack.push(target);
     }
   }
+  if (memoize) store.closureCache.set(tip, out);
   return out;
 }
 
@@ -565,24 +626,23 @@ export function selectFetchObjects(store: Store, wants: readonly string[], haves
       if (commit !== null) queue.push({ sha: commit, dist: 0 });
     }
   }
-  while (queue.length > 0) {
-    const { sha, dist } = queue.shift()!;
+  for (let head = 0; head < queue.length; head += 1) {
+    const { sha, dist } = queue[head]!;
     if (distance.has(sha) && distance.get(sha)! <= dist) continue;
     distance.set(sha, dist);
     includedCommits.add(sha);
     if (depth !== null && dist + 1 >= depth) continue;
-    const object = store.get(sha);
-    if (object === undefined || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) queue.push({ sha: parent, dist: dist + 1 });
+    const info = commitInfo(store, sha);
+    if (info === null) continue;
+    for (const parent of info.parents) queue.push({ sha: parent, dist: dist + 1 });
   }
 
   // The new boundary: included commits with at least one parent that exists but is not included.
   const newShallow: string[] = [];
   for (const sha of includedCommits) {
-    const object = store.get(sha);
-    if (object === undefined || object.type !== 'commit') continue;
-    const parents = parseCommit(object.data).parents;
-    if (parents.some((parent) => store.has(parent) && !includedCommits.has(parent))) newShallow.push(sha);
+    const info = commitInfo(store, sha);
+    if (info === null) continue;
+    if (info.parents.some((parent) => store.has(parent) && !includedCommits.has(parent))) newShallow.push(sha);
   }
   // Commits the client held as shallow whose parents are now included stop being shallow.
   const unshallow: string[] = [];
@@ -592,10 +652,10 @@ export function selectFetchObjects(store: Store, wants: readonly string[], haves
 
   const include = new Set<string>(wantObjects);
   for (const sha of includedCommits) {
-    const object = store.get(sha);
-    if (object === undefined || object.type !== 'commit') continue;
+    const info = commitInfo(store, sha);
+    if (info === null) continue;
     include.add(sha);
-    for (const objSha of objectClosure(store, parseCommit(object.data).tree)) include.add(objSha);
+    for (const objSha of objectClosure(store, info.tree)) include.add(objSha);
   }
   for (const sha of haveObjects) include.delete(sha);
   // A commit the client already has as a have is never re-sent, but its tree objects may still
